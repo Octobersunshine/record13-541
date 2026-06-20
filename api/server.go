@@ -25,7 +25,9 @@ type CreateTaskRequest struct {
 	EndOffset    int64  `json:"end_offset"`
 	Speed        string `json:"speed"`
 	AutoStart    bool   `json:"auto_start"`
+	PresetName   string `json:"preset_name"`
 	Throttle     *ThrottleRequest `json:"throttle,omitempty"`
+	ReadLimit    *ReadLimitRequest `json:"read_limit,omitempty"`
 }
 
 type ThrottleRequest struct {
@@ -35,6 +37,16 @@ type ThrottleRequest struct {
 	SleepSliceMs    int    `json:"sleep_slice_ms"`
 	Priority        int    `json:"priority"`
 	EnableAdaptive  bool   `json:"enable_adaptive"`
+}
+
+type ReadLimitRequest struct {
+	ReadsPerSecond        int64 `json:"reads_per_second"`
+	MBPerSecond           int64 `json:"mb_per_second"`
+	MinReadIntervalUs     int64 `json:"min_read_interval_us"`
+	MaxConsecutiveReads   int   `json:"max_consecutive_reads"`
+	AfterEachReadSleepUs  int64 `json:"after_each_read_sleep_us"`
+	StartupWarmupSec      int64 `json:"startup_warmup_sec"`
+	EnablePeriodLimits    bool  `json:"enable_period_limits"`
 }
 
 type UpdateRateLimitsRequest struct {
@@ -77,6 +89,7 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/throttle/global/resume", s.handleGlobalResume)
 	mux.HandleFunc("/api/throttle/all/pause", s.handleAllPause)
 	mux.HandleFunc("/api/throttle/all/resume", s.handleAllResume)
+	mux.HandleFunc("/api/throttle/presets", s.handlePresets)
 	mux.HandleFunc("/health", s.handleHealth)
 
 	srv := &http.Server{
@@ -88,16 +101,17 @@ func (s *Server) Run() error {
 
 	log.Printf("Disk scan server starting on %s", s.addr)
 	log.Printf("=== Task Management ===")
-	log.Printf("  POST   /api/tasks                  - Create scan task (with throttle config)")
+	log.Printf("  POST   /api/tasks                  - Create scan task (use preset_name or read_limit)")
 	log.Printf("  GET    /api/tasks                  - List all tasks")
 	log.Printf("  GET    /api/tasks/{id}             - Get task status and progress")
 	log.Printf("  POST   /api/tasks/{id}/start       - Start a task")
 	log.Printf("  POST   /api/tasks/{id}/cancel      - Cancel a task")
 	log.Printf("  POST   /api/tasks/{id}/pause       - Pause a running task")
 	log.Printf("  POST   /api/tasks/{id}/resume      - Resume a paused task")
-	log.Printf("  POST   /api/tasks/{id}/rate        - Update task IO rate limits")
+	log.Printf("  POST   /api/tasks/{id}/rate        - Update task IO rate limits (IOPS/MB)")
 	log.Printf("  POST   /api/tasks/{id}/timeslice   - Update task time-slice config")
 	log.Printf("=== Global IO Control ===")
+	log.Printf("  GET    /api/throttle/presets       - List all preset profiles (ultra_safe..night_only)")
 	log.Printf("  GET    /api/throttle/global        - Get global throttle status")
 	log.Printf("  PUT    /api/throttle/global        - Set global IO limits")
 	log.Printf("  POST   /api/throttle/global/pause  - EMERGENCY: pause all IO (critical!)")
@@ -106,7 +120,7 @@ func (s *Server) Run() error {
 	log.Printf("  POST   /api/throttle/all/resume    - Resume all paused tasks")
 	log.Printf("=== Streaming ===")
 	log.Printf("  GET    /api/stream/{id}            - SSE real-time progress stream")
-	log.Printf("  GET    /health                     - Health check")
+	log.Printf("  GET    /health                     - Health check (includes IO status)")
 	return srv.ListenAndServe()
 }
 
@@ -223,6 +237,55 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		EndOffset:   req.EndOffset,
 		Speed:       speed,
 	}
+	fullThrottleInitialized := false
+
+	if req.PresetName != "" {
+		config.UsePreset = true
+		config.PresetName = scanner.PresetProfile(req.PresetName)
+		preset := scanner.GetPresetConfig(config.PresetName)
+		config.FullThrottle = preset
+		config.Throttle = preset.ToScanThrottleConfig()
+		fullThrottleInitialized = true
+	}
+
+	if req.ReadLimit != nil {
+		rl := req.ReadLimit
+		if !fullThrottleInitialized {
+			fullCfg := scanner.DefaultThrottleConfig()
+			config.FullThrottle = fullCfg
+			fullThrottleInitialized = true
+		}
+
+		if rl.ReadsPerSecond > 0 {
+			config.FullThrottle.ReadRate.ReadsPerSecond = rl.ReadsPerSecond
+			config.Throttle.MaxIOPS = int(rl.ReadsPerSecond)
+		}
+		if rl.MBPerSecond > 0 {
+			config.FullThrottle.ReadRate.BytesPerSecond = rl.MBPerSecond * 1024 * 1024
+			config.Throttle.MaxBandwidthBps = rl.MBPerSecond * 1024 * 1024
+		}
+		if rl.MinReadIntervalUs > 0 {
+			config.FullThrottle.ReadRate.MinReadIntervalUs = rl.MinReadIntervalUs
+		}
+		if rl.MaxConsecutiveReads > 0 {
+			config.FullThrottle.ReadRate.MaxConsecutiveReads = rl.MaxConsecutiveReads
+		}
+		if rl.AfterEachReadSleepUs > 0 {
+			config.FullThrottle.ReadRate.AfterReadSleepUs = rl.AfterEachReadSleepUs
+		}
+		if rl.StartupWarmupSec > 0 {
+			config.FullThrottle.BehaviorConfig.StartupWarmupMs = rl.StartupWarmupSec * 1000
+		}
+		config.FullThrottle.BehaviorConfig.EnablePeriodLimits = rl.EnablePeriodLimits
+
+		if config.Throttle.MaxIOPS == 0 && config.FullThrottle.ReadRate.ReadsPerSecond > 0 {
+			config.Throttle.MaxIOPS = int(config.FullThrottle.ReadRate.ReadsPerSecond)
+		}
+		if config.Throttle.MaxBandwidthBps == 0 && config.FullThrottle.ReadRate.BytesPerSecond > 0 {
+			config.Throttle.MaxBandwidthBps = config.FullThrottle.ReadRate.BytesPerSecond
+		}
+		config.Throttle = config.FullThrottle.ToScanThrottleConfig()
+	}
 
 	if req.Throttle != nil {
 		t := req.Throttle
@@ -234,7 +297,24 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 			Priority:        scanner.IOPriority(t.Priority),
 			EnableAdaptive:  t.EnableAdaptive,
 		}
+		if !fullThrottleInitialized {
+			config.FullThrottle = scanner.DefaultThrottleConfig()
+			fullThrottleInitialized = true
+		}
+		if t.MaxIOPS > 0 {
+			config.FullThrottle.ReadRate.ReadsPerSecond = int64(t.MaxIOPS)
+		}
+		if t.MaxBandwidthMB > 0 {
+			config.FullThrottle.ReadRate.BytesPerSecond = int64(t.MaxBandwidthMB) * 1024 * 1024
+		}
 	}
+
+	if err := config.FullThrottle.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, "throttle config invalid: "+err.Error())
+		return
+	}
+
+	config.FullThrottle.OverrideDefaults = true
 
 	task, err := s.manager.CreateTask(req.Name, config)
 	if err != nil {
@@ -433,6 +513,26 @@ func (s *Server) handleAllResume(w http.ResponseWriter, r *http.Request) {
 	s.manager.ResumeAllTasks()
 	writeSuccess(w, map[string]string{
 		"message": "all tasks resumed",
+	})
+}
+
+func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "use GET to list presets")
+		return
+	}
+	presets := scanner.ListPresets()
+	writeSuccess(w, map[string]interface{}{
+		"count":            len(presets),
+		"presets":          presets,
+		"usage_hint":       "Set preset_name when creating task, e.g. \"preset_name\": \"conservative\"",
+		"recommended_for": map[string]string{
+			"ultra_safe":   "Production peak hours - minimum impact",
+			"conservative": "Daytime business hours - default",
+			"balanced":     "Off-peak hours - good balance",
+			"aggressive":   "Maintenance windows - fast scan",
+			"night_only":   "Midnight batch - maximum speed",
+		},
 	})
 }
 

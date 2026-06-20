@@ -11,13 +11,14 @@ import (
 type ScanStatus string
 
 const (
-	StatusPending   ScanStatus = "pending"
-	StatusRunning   ScanStatus = "running"
-	StatusCompleted ScanStatus = "completed"
-	StatusFailed    ScanStatus = "failed"
-	StatusCanceled  ScanStatus = "canceled"
-	StatusThrottled ScanStatus = "throttled"
-	StatusPaused    ScanStatus = "paused"
+	StatusPending    ScanStatus = "pending"
+	StatusRunning    ScanStatus = "running"
+	StatusCompleted  ScanStatus = "completed"
+	StatusFailed     ScanStatus = "failed"
+	StatusCanceled   ScanStatus = "canceled"
+	StatusThrottled  ScanStatus = "throttled"
+	StatusPaused     ScanStatus = "paused"
+	StatusWarmingUp  ScanStatus = "warming_up"
 )
 
 type IOPriority int
@@ -53,6 +54,19 @@ type ScanConfig struct {
 	EndOffset    int64
 	Speed        time.Duration
 	Throttle     ThrottleConfig
+	FullThrottle CompleteThrottleConfig
+	UsePreset    bool
+	PresetName   PresetProfile
+}
+
+type ReadControlStats struct {
+	TotalReads          int64         `json:"total_reads"`
+	BytesRead           int64         `json:"bytes_read_mb"`
+	ConsecutiveReadCount int64        `json:"consecutive_read_breaks"`
+	IntervalSleepCount  int64         `json:"interval_sleep_count"`
+	AfterReadSleepCount int64         `json:"after_read_sleep_count"`
+	WarmupPhaseMs       int64         `json:"warmup_phase_ms"`
+	PeriodCooldownCount int64         `json:"period_cooldown_count"`
 }
 
 type RateControlStats struct {
@@ -62,6 +76,8 @@ type RateControlStats struct {
 	EffectiveBW     float64       `json:"effective_bw_mbps"`
 	LoadAvg         float64       `json:"system_load_avg"`
 	PausedCount     int64         `json:"paused_count"`
+	ReadControl     ReadControlStats `json:"read_control"`
+	LimitConfig     map[string]interface{} `json:"limit_config"`
 }
 
 type ScanResult struct {
@@ -76,21 +92,35 @@ type ScanResult struct {
 	Elapsed      string           `json:"elapsed"`
 	RateStats    RateControlStats `json:"rate_stats"`
 	IsThrottled  bool             `json:"is_throttled"`
+	PresetUsed   string           `json:"preset_used,omitempty"`
 }
 
 type DiskScanner struct {
-	taskID         string
-	config         ScanConfig
-	result         *ScanResult
-	running        bool
-	cancel         context.CancelFunc
-	pauseCh        chan struct{}
-	resumeCh       chan struct{}
-	paused         bool
-	rateLimiter    *RateLimiter
-	timeSliceSched *TimeSliceScheduler
-	lastProgressAt time.Time
-	lastScanned    int64
+	taskID              string
+	config              ScanConfig
+	result              *ScanResult
+	running             bool
+	cancel              context.CancelFunc
+	pauseCh             chan struct{}
+	resumeCh            chan struct{}
+	paused              bool
+	rateLimiter         *RateLimiter
+	timeSliceSched      *TimeSliceScheduler
+	warmupCtrl          *WarmupController
+	lastProgressAt      time.Time
+	lastScanned         int64
+	consecutiveReads    int
+	lastReadAt          time.Time
+	periodTrackers      []*periodTracker
+}
+
+type periodTracker struct {
+	config      IOPeriodLimit
+	windowStart time.Time
+	readsInWin  int64
+	bytesInWin  int64
+	inCooldown  bool
+	cooldownEnd time.Time
 }
 
 func NewDiskScanner(config ScanConfig) *DiskScanner {
@@ -100,10 +130,19 @@ func NewDiskScanner(config ScanConfig) *DiskScanner {
 	if config.EndOffset == 0 {
 		config.EndOffset = 1024 * 1024 * 1024
 	}
-	if config.Throttle.MaxIOPS == 0 && config.Throttle.MaxBandwidthBps == 0 {
-		config.Throttle.MaxIOPS = 200
-		config.Throttle.MaxBandwidthBps = 50 * 1024 * 1024
+
+	if config.UsePreset && config.PresetName != "" {
+		full := GetPresetConfig(config.PresetName)
+		config.FullThrottle = full
+		config.Throttle = full.ToScanThrottleConfig()
+	} else if config.Throttle.MaxIOPS == 0 && config.Throttle.MaxBandwidthBps == 0 {
+		full := GetPresetConfig(ProfileConservative)
+		config.FullThrottle = full
+		config.Throttle = full.ToScanThrottleConfig()
+		config.PresetName = ProfileConservative
+		config.UsePreset = true
 	}
+
 	if config.Throttle.ScanSlice == 0 {
 		config.Throttle.ScanSlice = 200 * time.Millisecond
 	}
@@ -111,15 +150,34 @@ func NewDiskScanner(config ScanConfig) *DiskScanner {
 		config.Throttle.SleepSlice = 100 * time.Millisecond
 	}
 
+	rc := ReadControlStats{}
+	rateStats := RateControlStats{
+		ReadControl: rc,
+		LimitConfig: config.FullThrottle.Summary(),
+	}
+
 	ds := &DiskScanner{
 		config: config,
 		result: &ScanResult{
-			Status:    StatusPending,
-			BadBlocks: make([]BadBlock, 0),
+			Status:     StatusPending,
+			BadBlocks:  make([]BadBlock, 0),
+			RateStats:  rateStats,
+			PresetUsed: string(config.PresetName),
 		},
 		pauseCh:  make(chan struct{}, 1),
 		resumeCh: make(chan struct{}, 1),
 	}
+
+	if config.FullThrottle.BehaviorConfig.EnablePeriodLimits &&
+		len(config.FullThrottle.PeriodLimits) > 0 {
+		for _, p := range config.FullThrottle.PeriodLimits {
+			ds.periodTrackers = append(ds.periodTrackers, &periodTracker{
+				config:      p,
+				windowStart: time.Now(),
+			})
+		}
+	}
+
 	return ds
 }
 
@@ -136,8 +194,10 @@ func (ds *DiskScanner) Start(ctx context.Context, callback ProgressCallback) (*S
 	ds.cancel = cancel
 	ds.running = true
 	ds.lastProgressAt = time.Now()
+	ds.lastReadAt = time.Now()
 
 	throttle := ds.config.Throttle
+	fullCfg := ds.config.FullThrottle
 	maxIOPS := throttle.MaxIOPS
 	maxBW := throttle.MaxBandwidthBps
 
@@ -161,11 +221,22 @@ func (ds *DiskScanner) Start(ctx context.Context, callback ProgressCallback) (*S
 		maxBW = int64(float64(maxBW) * 1.5)
 	}
 
-	ds.rateLimiter = NewRateLimiter(maxIOPS, maxBW)
+	ds.warmupCtrl = NewWarmupController(fullCfg.BehaviorConfig, int64(maxIOPS), maxBW)
+
+	initialRPS, initialBPS := ds.warmupCtrl.CurrentLimits()
+	if ds.warmupCtrl.IsWarmingUp() {
+		ds.rateLimiter = NewRateLimiter(int(initialRPS), initialBPS)
+	} else {
+		ds.rateLimiter = NewRateLimiter(maxIOPS, maxBW)
+	}
+
 	ds.timeSliceSched = NewTimeSliceScheduler(throttle.ScanSlice, throttle.SleepSlice)
 	ds.timeSliceSched.Start(scanCtx)
 
 	ds.result.Status = StatusRunning
+	if ds.warmupCtrl.IsWarmingUp() {
+		ds.result.Status = StatusWarmingUp
+	}
 	ds.result.StartTime = time.Now()
 	ds.result.TotalBlocks = (ds.config.EndOffset - ds.config.StartOffset) / ds.config.BlockSize
 	if ds.result.TotalBlocks <= 0 {
@@ -180,6 +251,11 @@ func (ds *DiskScanner) Start(ctx context.Context, callback ProgressCallback) (*S
 		elapsed := ds.result.EndTime.Sub(ds.result.StartTime)
 		ds.result.Elapsed = formatDuration(elapsed)
 		ds.result.RateStats.TotalWaitTime += time.Since(startWait)
+
+		rc := ds.result.RateStats.ReadControl
+		rc.TotalReads = ds.result.Scanned
+		rc.BytesRead = ds.result.Scanned * ds.config.BlockSize / (1024 * 1024)
+		ds.result.RateStats.ReadControl = rc
 
 		if elapsed > 0 {
 			ds.result.RateStats.EffectiveIOPS = float64(ds.result.Scanned) / elapsed.Seconds()
@@ -196,6 +272,11 @@ func (ds *DiskScanner) Start(ctx context.Context, callback ProgressCallback) (*S
 
 	loadCheckInterval := time.NewTicker(5 * time.Second)
 	defer loadCheckInterval.Stop()
+
+	warmupCheckInterval := time.NewTicker(200 * time.Millisecond)
+	defer warmupCheckInterval.Stop()
+
+	readCfg := fullCfg.ReadRate
 
 	for i := int64(0); i < ds.result.TotalBlocks; i++ {
 		select {
@@ -243,6 +324,40 @@ func (ds *DiskScanner) Start(ctx context.Context, callback ProgressCallback) (*S
 			}
 		}
 
+		for _, pt := range ds.periodTrackers {
+			if pt.inCooldown {
+				if time.Now().Before(pt.cooldownEnd) {
+					throttled = true
+					ds.result.RateStats.ThrottleCount++
+					ds.result.RateStats.ReadControl.PeriodCooldownCount++
+					remain := time.Until(pt.cooldownEnd)
+					if remain > 100*time.Millisecond {
+						remain = 100 * time.Millisecond
+					}
+					if err := sleepWithCtx(scanCtx, remain); err != nil {
+						return ds.result, nil
+					}
+					continue
+				}
+				pt.inCooldown = false
+				pt.windowStart = time.Now()
+				pt.readsInWin = 0
+				pt.bytesInWin = 0
+			}
+		}
+
+		select {
+		case <-warmupCheckInterval.C:
+			if ds.warmupCtrl.IsWarmingUp() {
+				curRPS, curBPS := ds.warmupCtrl.CurrentLimits()
+				ds.rateLimiter.SetLimits(int(curRPS), curBPS)
+			} else if ds.result.Status == StatusWarmingUp {
+				ds.result.Status = StatusRunning
+				ds.rateLimiter.SetLimits(maxIOPS, maxBW)
+			}
+		default:
+		}
+
 		if ds.rateLimiter != nil && ds.rateLimiter.IsEnabled() {
 			waitStart := time.Now()
 			if err := ds.rateLimiter.Wait(scanCtx, ds.config.BlockSize); err != nil {
@@ -260,12 +375,70 @@ func (ds *DiskScanner) Start(ctx context.Context, callback ProgressCallback) (*S
 			}
 		}
 
+		if readCfg.MinReadIntervalUs > 0 {
+			elapsed := time.Since(ds.lastReadAt)
+			minInterval := time.Duration(readCfg.MinReadIntervalUs) * time.Microsecond
+			if elapsed < minInterval {
+				waitTime := minInterval - elapsed
+				throttled = true
+				ds.result.RateStats.ReadControl.IntervalSleepCount++
+				ds.result.RateStats.TotalWaitTime += waitTime
+				if err := sleepWithCtx(scanCtx, waitTime); err != nil {
+					return ds.result, nil
+				}
+			}
+		}
+
+		if readCfg.MaxConsecutiveReads > 0 {
+			ds.consecutiveReads++
+			if ds.consecutiveReads >= readCfg.MaxConsecutiveReads {
+				ds.consecutiveReads = 0
+				sleepUs := int64(2000)
+				if readCfg.AfterReadSleepUs > 0 {
+					sleepUs = readCfg.AfterReadSleepUs
+				}
+				throttled = true
+				ds.result.RateStats.ReadControl.ConsecutiveReadCount++
+				sleepDur := time.Duration(sleepUs) * time.Microsecond
+				ds.result.RateStats.TotalWaitTime += sleepDur
+				if err := sleepWithCtx(scanCtx, sleepDur); err != nil {
+					return ds.result, nil
+				}
+			}
+		} else if readCfg.AfterReadSleepUs > 0 {
+			sleepDur := time.Duration(readCfg.AfterReadSleepUs) * time.Microsecond
+			throttled = true
+			ds.result.RateStats.ReadControl.AfterReadSleepCount++
+			ds.result.RateStats.TotalWaitTime += sleepDur
+			if err := sleepWithCtx(scanCtx, sleepDur); err != nil {
+				return ds.result, nil
+			}
+		}
+
+		ds.lastReadAt = time.Now()
+
 		offset := ds.config.StartOffset + i*ds.config.BlockSize
 		badBlock, err := ds.scanBlock(i, offset)
 		if err != nil {
 			ds.result.Status = StatusFailed
 			ds.result.Error = err.Error()
 			return ds.result, err
+		}
+
+		for _, pt := range ds.periodTrackers {
+			pt.readsInWin++
+			pt.bytesInWin += ds.config.BlockSize
+			if time.Since(pt.windowStart) >= pt.config.WindowDuration {
+				if (pt.config.MaxReadsInWindow > 0 && pt.readsInWin > pt.config.MaxReadsInWindow) ||
+					(pt.config.MaxBytesInWindow > 0 && pt.bytesInWin > pt.config.MaxBytesInWindow) {
+					pt.inCooldown = true
+					pt.cooldownEnd = time.Now().Add(pt.config.CooldownAfterWindow)
+				} else {
+					pt.windowStart = time.Now()
+					pt.readsInWin = 0
+					pt.bytesInWin = 0
+				}
+			}
 		}
 
 		ds.result.Scanned = i + 1
@@ -275,7 +448,10 @@ func (ds *DiskScanner) Start(ctx context.Context, callback ProgressCallback) (*S
 
 		ds.result.Percent = float64(ds.result.Scanned) / float64(ds.result.TotalBlocks) * 100
 		ds.result.IsThrottled = throttled
-		if throttled && ds.result.Status == StatusRunning {
+
+		if ds.warmupCtrl.IsWarmingUp() {
+			ds.result.Status = StatusWarmingUp
+		} else if throttled && ds.result.Status == StatusRunning {
 			ds.result.Status = StatusThrottled
 		} else if !throttled && ds.result.Status == StatusThrottled {
 			ds.result.Status = StatusRunning
@@ -290,7 +466,15 @@ func (ds *DiskScanner) Start(ctx context.Context, callback ProgressCallback) (*S
 			if throttle.EnableAdaptive && ds.taskID != "" {
 				gt := GetGlobalIOThrottle()
 				newIOPS, newBW := gt.RegisterTask(ds.taskID, ds.config.Throttle.MaxIOPS, ds.config.Throttle.MaxBandwidthBps)
-				if ds.rateLimiter != nil {
+				switch throttle.Priority {
+				case PriorityLow:
+					newIOPS = int(float64(newIOPS) * 0.4)
+					newBW = int64(float64(newBW) * 0.4)
+				case PriorityHigh:
+					newIOPS = int(float64(newIOPS) * 1.5)
+					newBW = int64(float64(newBW) * 1.5)
+				}
+				if !ds.warmupCtrl.IsWarmingUp() {
 					ds.rateLimiter.SetLimits(newIOPS, newBW)
 				}
 			}
