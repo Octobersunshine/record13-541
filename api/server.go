@@ -18,13 +18,39 @@ type Server struct {
 }
 
 type CreateTaskRequest struct {
-	Name        string `json:"name"`
-	DiskPath    string `json:"disk_path"`
-	BlockSize   int64  `json:"block_size"`
-	StartOffset int64  `json:"start_offset"`
-	EndOffset   int64  `json:"end_offset"`
-	Speed       string `json:"speed"`
-	AutoStart   bool   `json:"auto_start"`
+	Name         string `json:"name"`
+	DiskPath     string `json:"disk_path"`
+	BlockSize    int64  `json:"block_size"`
+	StartOffset  int64  `json:"start_offset"`
+	EndOffset    int64  `json:"end_offset"`
+	Speed        string `json:"speed"`
+	AutoStart    bool   `json:"auto_start"`
+	Throttle     *ThrottleRequest `json:"throttle,omitempty"`
+}
+
+type ThrottleRequest struct {
+	MaxIOPS         int    `json:"max_iops"`
+	MaxBandwidthMB  int    `json:"max_bandwidth_mb"`
+	ScanSliceMs     int    `json:"scan_slice_ms"`
+	SleepSliceMs    int    `json:"sleep_slice_ms"`
+	Priority        int    `json:"priority"`
+	EnableAdaptive  bool   `json:"enable_adaptive"`
+}
+
+type UpdateRateLimitsRequest struct {
+	MaxIOPS        int `json:"max_iops"`
+	MaxBandwidthMB int `json:"max_bandwidth_mb"`
+}
+
+type UpdateTimeSliceRequest struct {
+	ScanSliceMs  int `json:"scan_slice_ms"`
+	SleepSliceMs int `json:"sleep_slice_ms"`
+}
+
+type GlobalLimitsRequest struct {
+	MaxConcurrent   int64 `json:"max_concurrent"`
+	MaxTotalIOPS    int64 `json:"max_total_iops"`
+	MaxTotalBWMB    int64 `json:"max_total_bw_mb"`
 }
 
 type Response struct {
@@ -46,6 +72,11 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/api/tasks", s.handleTasks)
 	mux.HandleFunc("/api/tasks/", s.handleTaskByID)
 	mux.HandleFunc("/api/stream/", s.handleStream)
+	mux.HandleFunc("/api/throttle/global", s.handleGlobalThrottle)
+	mux.HandleFunc("/api/throttle/global/pause", s.handleGlobalPause)
+	mux.HandleFunc("/api/throttle/global/resume", s.handleGlobalResume)
+	mux.HandleFunc("/api/throttle/all/pause", s.handleAllPause)
+	mux.HandleFunc("/api/throttle/all/resume", s.handleAllResume)
 	mux.HandleFunc("/health", s.handleHealth)
 
 	srv := &http.Server{
@@ -56,14 +87,26 @@ func (s *Server) Run() error {
 	}
 
 	log.Printf("Disk scan server starting on %s", s.addr)
-	log.Printf("API Endpoints:")
-	log.Printf("  POST   /api/tasks          - Create and optionally start a scan task")
-	log.Printf("  GET    /api/tasks          - List all tasks")
-	log.Printf("  GET    /api/tasks/{id}     - Get task status and progress")
-	log.Printf("  POST   /api/tasks/{id}/start   - Start a task")
-	log.Printf("  POST   /api/tasks/{id}/cancel  - Cancel a running task")
-	log.Printf("  GET    /api/stream/{id}    - SSE real-time progress stream")
-	log.Printf("  GET    /health             - Health check")
+	log.Printf("=== Task Management ===")
+	log.Printf("  POST   /api/tasks                  - Create scan task (with throttle config)")
+	log.Printf("  GET    /api/tasks                  - List all tasks")
+	log.Printf("  GET    /api/tasks/{id}             - Get task status and progress")
+	log.Printf("  POST   /api/tasks/{id}/start       - Start a task")
+	log.Printf("  POST   /api/tasks/{id}/cancel      - Cancel a task")
+	log.Printf("  POST   /api/tasks/{id}/pause       - Pause a running task")
+	log.Printf("  POST   /api/tasks/{id}/resume      - Resume a paused task")
+	log.Printf("  POST   /api/tasks/{id}/rate        - Update task IO rate limits")
+	log.Printf("  POST   /api/tasks/{id}/timeslice   - Update task time-slice config")
+	log.Printf("=== Global IO Control ===")
+	log.Printf("  GET    /api/throttle/global        - Get global throttle status")
+	log.Printf("  PUT    /api/throttle/global        - Set global IO limits")
+	log.Printf("  POST   /api/throttle/global/pause  - EMERGENCY: pause all IO (critical!)")
+	log.Printf("  POST   /api/throttle/global/resume - Resume from emergency pause")
+	log.Printf("  POST   /api/throttle/all/pause     - Pause all scan tasks")
+	log.Printf("  POST   /api/throttle/all/resume    - Resume all paused tasks")
+	log.Printf("=== Streaming ===")
+	log.Printf("  GET    /api/stream/{id}            - SSE real-time progress stream")
+	log.Printf("  GET    /health                     - Health check")
 	return srv.ListenAndServe()
 }
 
@@ -72,9 +115,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeSuccess(w, map[string]string{
-		"status": "ok",
-		"time":   time.Now().Format(time.RFC3339),
+	status := s.manager.GetGlobalThrottleStatus()
+	writeSuccess(w, map[string]interface{}{
+		"status":    "ok",
+		"time":      time.Now().Format(time.RFC3339),
+		"io_status": status,
 	})
 }
 
@@ -114,17 +159,17 @@ func (s *Server) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 		action := parts[1]
 		switch action {
 		case "start":
-			if r.Method == http.MethodPost {
-				s.startTask(w, r, taskID)
-			} else {
-				writeError(w, http.StatusMethodNotAllowed, "use POST to start task")
-			}
+			s.requirePOST(w, r, func() { s.startTask(w, r, taskID) })
 		case "cancel":
-			if r.Method == http.MethodPost {
-				s.cancelTask(w, r, taskID)
-			} else {
-				writeError(w, http.StatusMethodNotAllowed, "use POST to cancel task")
-			}
+			s.requirePOST(w, r, func() { s.cancelTask(w, r, taskID) })
+		case "pause":
+			s.requirePOST(w, r, func() { s.pauseTask(w, r, taskID) })
+		case "resume":
+			s.requirePOST(w, r, func() { s.resumeTask(w, r, taskID) })
+		case "rate":
+			s.requirePOSTOrPUT(w, r, func() { s.updateTaskRate(w, r, taskID) })
+		case "timeslice":
+			s.requirePOSTOrPUT(w, r, func() { s.updateTaskTimeSlice(w, r, taskID) })
 		default:
 			writeError(w, http.StatusNotFound, "unknown action: "+action)
 		}
@@ -132,6 +177,22 @@ func (s *Server) handleTaskByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeError(w, http.StatusNotFound, "invalid path")
+}
+
+func (s *Server) requirePOST(w http.ResponseWriter, r *http.Request, handler func()) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "use POST method")
+		return
+	}
+	handler()
+}
+
+func (s *Server) requirePOSTOrPUT(w http.ResponseWriter, r *http.Request, handler func()) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		writeError(w, http.StatusMethodNotAllowed, "use POST or PUT method")
+		return
+	}
+	handler()
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -161,6 +222,18 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		StartOffset: req.StartOffset,
 		EndOffset:   req.EndOffset,
 		Speed:       speed,
+	}
+
+	if req.Throttle != nil {
+		t := req.Throttle
+		config.Throttle = scanner.ThrottleConfig{
+			MaxIOPS:         t.MaxIOPS,
+			MaxBandwidthBps: int64(t.MaxBandwidthMB) * 1024 * 1024,
+			ScanSlice:       time.Duration(t.ScanSliceMs) * time.Millisecond,
+			SleepSlice:      time.Duration(t.SleepSliceMs) * time.Millisecond,
+			Priority:        scanner.IOPriority(t.Priority),
+			EnableAdaptive:  t.EnableAdaptive,
+		}
 	}
 
 	task, err := s.manager.CreateTask(req.Name, config)
@@ -212,6 +285,157 @@ func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request, taskID strin
 	writeSuccess(w, info)
 }
 
+func (s *Server) pauseTask(w http.ResponseWriter, r *http.Request, taskID string) {
+	if err := s.manager.PauseTask(taskID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	info, _ := s.manager.GetTaskInfo(taskID)
+	writeSuccess(w, info)
+}
+
+func (s *Server) resumeTask(w http.ResponseWriter, r *http.Request, taskID string) {
+	if err := s.manager.ResumeTask(taskID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	info, _ := s.manager.GetTaskInfo(taskID)
+	writeSuccess(w, info)
+}
+
+func (s *Server) updateTaskRate(w http.ResponseWriter, r *http.Request, taskID string) {
+	var req UpdateRateLimitsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if req.MaxIOPS <= 0 && req.MaxBandwidthMB <= 0 {
+		writeError(w, http.StatusBadRequest, "at least one of max_iops or max_bandwidth_mb must be positive")
+		return
+	}
+
+	maxBW := int64(req.MaxBandwidthMB) * 1024 * 1024
+	if err := s.manager.UpdateTaskRateLimits(taskID, req.MaxIOPS, maxBW); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	info, _ := s.manager.GetTaskInfo(taskID)
+	writeSuccess(w, map[string]interface{}{
+		"message":       fmt.Sprintf("rate limits updated: IOPS=%d, BW=%d MB/s", req.MaxIOPS, req.MaxBandwidthMB),
+		"effective_max": map[string]interface{}{
+			"max_iops":       req.MaxIOPS,
+			"max_bandwidth":  req.MaxBandwidthMB,
+			"unit":           "MB/s",
+		},
+		"task": info,
+	})
+}
+
+func (s *Server) updateTaskTimeSlice(w http.ResponseWriter, r *http.Request, taskID string) {
+	var req UpdateTimeSliceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if req.ScanSliceMs <= 0 || req.SleepSliceMs < 0 {
+		writeError(w, http.StatusBadRequest, "scan_slice_ms must be > 0, sleep_slice_ms must be >= 0")
+		return
+	}
+
+	scanSlice := time.Duration(req.ScanSliceMs) * time.Millisecond
+	sleepSlice := time.Duration(req.SleepSliceMs) * time.Millisecond
+
+	if err := s.manager.UpdateTaskTimeSlice(taskID, scanSlice, sleepSlice); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	info, _ := s.manager.GetTaskInfo(taskID)
+	writeSuccess(w, map[string]interface{}{
+		"message": fmt.Sprintf("time-slice updated: scan=%dms, sleep=%dms, duty=%.0f%%",
+			req.ScanSliceMs, req.SleepSliceMs,
+			float64(req.ScanSliceMs)/float64(req.ScanSliceMs+req.SleepSliceMs)*100),
+		"task": info,
+	})
+}
+
+func (s *Server) handleGlobalThrottle(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		status := s.manager.GetGlobalThrottleStatus()
+		writeSuccess(w, status)
+	case http.MethodPut, http.MethodPost:
+		var req GlobalLimitsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+		maxBW := req.MaxTotalBWMB * 1024 * 1024
+		s.manager.SetGlobalLimits(req.MaxConcurrent, req.MaxTotalIOPS, maxBW)
+		status := s.manager.GetGlobalThrottleStatus()
+		writeSuccess(w, map[string]interface{}{
+			"message": "global limits updated",
+			"status":  status,
+		})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "use GET or PUT method")
+	}
+}
+
+func (s *Server) handleGlobalPause(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "use POST for emergency pause")
+		return
+	}
+	s.manager.EmergencyPause()
+	status := s.manager.GetGlobalThrottleStatus()
+	log.Printf("⚠️  EMERGENCY PAUSE triggered! All IO throttled to minimum.")
+	writeSuccess(w, map[string]interface{}{
+		"warning": "EMERGENCY PAUSE ACTIVE - All scan tasks are throttled to near-zero IO",
+		"action":  "Call POST /api/throttle/global/resume to restore normal operation",
+		"status":  status,
+	})
+}
+
+func (s *Server) handleGlobalResume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "use POST for resume")
+		return
+	}
+	s.manager.EmergencyResume()
+	status := s.manager.GetGlobalThrottleStatus()
+	log.Printf("Emergency pause released. IO limits restored.")
+	writeSuccess(w, map[string]interface{}{
+		"message": "Emergency pause released",
+		"status":  status,
+	})
+}
+
+func (s *Server) handleAllPause(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	s.manager.PauseAllTasks()
+	writeSuccess(w, map[string]string{
+		"message": "all tasks paused",
+	})
+}
+
+func (s *Server) handleAllResume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	s.manager.ResumeAllTasks()
+	writeSuccess(w, map[string]string{
+		"message": "all tasks resumed",
+	})
+}
+
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "use GET for SSE stream")
@@ -251,9 +475,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	notify := r.Context().Done()
 
-	writeSSE(w, flusher, "connected", map[string]string{
-		"task_id": taskID,
-		"message": "subscribed to progress stream",
+	globalStatus := s.manager.GetGlobalThrottleStatus()
+	writeSSE(w, flusher, "connected", map[string]interface{}{
+		"task_id":       taskID,
+		"message":       "subscribed to progress stream",
+		"global_status": globalStatus,
 	})
 
 	progress, _ := s.manager.GetTaskProgress(taskID)
@@ -262,9 +488,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			"task_id":    taskID,
 			"current":    progress.Scanned,
 			"total":      progress.TotalBlocks,
-			"percent":    progress.Percent,
+			"percent":    formatPercent(progress.Percent),
 			"status":     progress.Status,
 			"bad_blocks": len(progress.BadBlocks),
+			"throttled":  progress.IsThrottled,
+			"rate_stats": progress.RateStats,
 		})
 	}
 
@@ -285,12 +513,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				"percent":    formatPercent(event.Percent),
 				"bad_blocks": len(event.BadBlocks),
 				"final":      event.Final,
+				"throttled":  event.Throttled,
 			}
 
 			if event.Final && event.Result != nil {
 				eventData["status"] = event.Result.Status
 				eventData["result"] = event.Result
 				eventData["elapsed"] = event.Result.Elapsed
+				eventData["rate_stats"] = event.Result.RateStats
 			}
 
 			eventType := "progress"

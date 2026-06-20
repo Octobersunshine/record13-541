@@ -12,23 +12,24 @@ import (
 )
 
 type Task struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	CreatedAt  time.Time         `json:"created_at"`
-	Scanner    *scanner.DiskScanner `json:"-"`
-	Config     scanner.ScanConfig `json:"config"`
+	ID         string                      `json:"id"`
+	Name       string                      `json:"name"`
+	CreatedAt  time.Time                   `json:"created_at"`
+	Scanner    *scanner.DiskScanner        `json:"-"`
+	Config     scanner.ScanConfig          `json:"config"`
 	Observers  map[string]chan ProgressEvent `json:"-"`
 	observerMu sync.RWMutex
 }
 
 type ProgressEvent struct {
-	TaskID   string             `json:"task_id"`
-	Current  int64              `json:"current"`
-	Total    int64              `json:"total"`
-	Percent  float64            `json:"percent"`
-	BadBlocks []scanner.BadBlock `json:"bad_blocks"`
-	Final    bool               `json:"final"`
-	Result   *scanner.ScanResult `json:"result,omitempty"`
+	TaskID     string             `json:"task_id"`
+	Current    int64              `json:"current"`
+	Total      int64              `json:"total"`
+	Percent    float64            `json:"percent"`
+	BadBlocks  []scanner.BadBlock `json:"bad_blocks"`
+	Final      bool               `json:"final"`
+	Result     *scanner.ScanResult `json:"result,omitempty"`
+	Throttled  bool               `json:"throttled"`
 }
 
 type TaskManager struct {
@@ -53,12 +54,15 @@ func GetTaskManager() *TaskManager {
 func (tm *TaskManager) CreateTask(name string, config scanner.ScanConfig) (*Task, error) {
 	taskID := uuid.New().String()
 
+	ds := scanner.NewDiskScanner(config)
+	ds.SetTaskID(taskID)
+
 	task := &Task{
 		ID:        taskID,
 		Name:      name,
 		CreatedAt: time.Now(),
 		Config:    config,
-		Scanner:   scanner.NewDiskScanner(config),
+		Scanner:   ds,
 		Observers: make(map[string]chan ProgressEvent),
 	}
 
@@ -85,7 +89,7 @@ func (tm *TaskManager) StartTask(taskID string) error {
 	go func() {
 		ctx := context.Background()
 
-		callback := func(current, total int64, percent float64, badBlocks []scanner.BadBlock) {
+		callback := func(current, total int64, percent float64, badBlocks []scanner.BadBlock, throttled bool) {
 			event := ProgressEvent{
 				TaskID:    taskID,
 				Current:   current,
@@ -93,6 +97,7 @@ func (tm *TaskManager) StartTask(taskID string) error {
 				Percent:   percent,
 				BadBlocks: badBlocks,
 				Final:     false,
+				Throttled: throttled,
 			}
 			task.broadcastEvent(event)
 		}
@@ -107,6 +112,7 @@ func (tm *TaskManager) StartTask(taskID string) error {
 			BadBlocks: result.BadBlocks,
 			Final:     true,
 			Result:    result,
+			Throttled: false,
 		}
 		task.broadcastEvent(finalEvent)
 	}()
@@ -124,6 +130,84 @@ func (tm *TaskManager) CancelTask(taskID string) error {
 	}
 
 	task.Scanner.Cancel()
+	return nil
+}
+
+func (tm *TaskManager) PauseTask(taskID string) error {
+	tm.mu.RLock()
+	task, exists := tm.tasks[taskID]
+	tm.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("task %s not found", taskID)
+	}
+
+	task.Scanner.Pause()
+	return nil
+}
+
+func (tm *TaskManager) ResumeTask(taskID string) error {
+	tm.mu.RLock()
+	task, exists := tm.tasks[taskID]
+	tm.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("task %s not found", taskID)
+	}
+
+	task.Scanner.Resume()
+	return nil
+}
+
+func (tm *TaskManager) PauseAllTasks() {
+	tm.mu.RLock()
+	tasks := make([]*Task, 0, len(tm.tasks))
+	for _, t := range tm.tasks {
+		tasks = append(tasks, t)
+	}
+	tm.mu.RUnlock()
+
+	for _, t := range tasks {
+		t.Scanner.Pause()
+	}
+}
+
+func (tm *TaskManager) ResumeAllTasks() {
+	tm.mu.RLock()
+	tasks := make([]*Task, 0, len(tm.tasks))
+	for _, t := range tm.tasks {
+		tasks = append(tasks, t)
+	}
+	tm.mu.RUnlock()
+
+	for _, t := range tasks {
+		t.Scanner.Resume()
+	}
+}
+
+func (tm *TaskManager) UpdateTaskRateLimits(taskID string, maxIOPS int, maxBandwidthBps int64) error {
+	tm.mu.RLock()
+	task, exists := tm.tasks[taskID]
+	tm.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("task %s not found", taskID)
+	}
+
+	task.Scanner.UpdateRateLimits(maxIOPS, maxBandwidthBps)
+	return nil
+}
+
+func (tm *TaskManager) UpdateTaskTimeSlice(taskID string, scanSlice, sleepSlice time.Duration) error {
+	tm.mu.RLock()
+	task, exists := tm.tasks[taskID]
+	tm.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("task %s not found", taskID)
+	}
+
+	task.Scanner.UpdateTimeSlice(scanSlice, sleepSlice)
 	return nil
 }
 
@@ -209,13 +293,23 @@ func (t *Task) broadcastEvent(event ProgressEvent) {
 	}
 }
 
+type GlobalThrottleStatus struct {
+	ActiveTaskCount    int64            `json:"active_task_count"`
+	MaxConcurrentTasks int64            `json:"max_concurrent_tasks"`
+	CurrentMaxIOPS     int              `json:"current_max_iops"`
+	CurrentMaxBWMBps   float64          `json:"current_max_bw_mbps"`
+	SystemLoad         scanner.SystemLoad `json:"system_load"`
+	EmergencyPaused    bool             `json:"emergency_paused"`
+}
+
 type TaskInfo struct {
-	ID         string             `json:"id"`
-	Name       string             `json:"name"`
-	CreatedAt  time.Time          `json:"created_at"`
-	Config     scanner.ScanConfig `json:"config"`
+	ID         string              `json:"id"`
+	Name       string              `json:"name"`
+	CreatedAt  time.Time           `json:"created_at"`
+	Config     scanner.ScanConfig  `json:"config"`
 	Progress   *scanner.ScanResult `json:"progress"`
-	IsRunning  bool               `json:"is_running"`
+	IsRunning  bool                `json:"is_running"`
+	IsPaused   bool                `json:"is_paused"`
 }
 
 func (tm *TaskManager) GetTaskInfo(taskID string) (*TaskInfo, error) {
@@ -230,6 +324,7 @@ func (tm *TaskManager) GetTaskInfo(taskID string) (*TaskInfo, error) {
 		Config:    task.Config,
 		Progress:  task.Scanner.GetResult(),
 		IsRunning: task.Scanner.IsRunning(),
+		IsPaused:  task.Scanner.IsPaused(),
 	}, nil
 }
 
@@ -244,9 +339,41 @@ func (tm *TaskManager) ListTaskInfos() []*TaskInfo {
 			Config:    task.Config,
 			Progress:  task.Scanner.GetResult(),
 			IsRunning: task.Scanner.IsRunning(),
+			IsPaused:  task.Scanner.IsPaused(),
 		})
 	}
 	return infos
+}
+
+func (tm *TaskManager) GetGlobalThrottleStatus() GlobalThrottleStatus {
+	gt := scanner.GetGlobalIOThrottle()
+	maxIOPS, maxBW := gt.GetCurrentGlobalLimits()
+	return GlobalThrottleStatus{
+		ActiveTaskCount:    gt.GetActiveCount(),
+		MaxConcurrentTasks: 2,
+		CurrentMaxIOPS:     maxIOPS,
+		CurrentMaxBWMBps:   float64(maxBW) / (1024 * 1024),
+		SystemLoad:         gt.GetSystemLoad(),
+		EmergencyPaused:    gt.IsEmergencyPaused(),
+	}
+}
+
+func (tm *TaskManager) EmergencyPause() {
+	scanner.GetGlobalIOThrottle().EmergencyPause()
+}
+
+func (tm *TaskManager) EmergencyResume() {
+	scanner.GetGlobalIOThrottle().EmergencyResume()
+}
+
+func (tm *TaskManager) SetGlobalLimits(maxConcurrent int64, maxTotalIOPS int64, maxTotalBW int64) {
+	gt := scanner.GetGlobalIOThrottle()
+	if maxConcurrent > 0 {
+		gt.SetMaxConcurrent(maxConcurrent)
+	}
+	if maxTotalIOPS > 0 || maxTotalBW > 0 {
+		gt.SetGlobalLimits(maxTotalIOPS, maxTotalBW)
+	}
 }
 
 func (ti *TaskInfo) ToJSON() (string, error) {
